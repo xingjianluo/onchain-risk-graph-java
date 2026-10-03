@@ -2,6 +2,7 @@ package com.github.xingjianluo.onchainriskgraphjava.service;
 
 import com.github.xingjianluo.onchainriskgraphjava.model.FundFlow;
 import com.github.xingjianluo.onchainriskgraphjava.model.Transaction;
+import com.github.xingjianluo.onchainriskgraphjava.query.QueryValidator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -23,10 +24,9 @@ public class FundFlowService {
     }
 
     public FundFlow summarize(String address, long asOf) {
-        if (address == null || address.isBlank()) {
-            throw new IllegalArgumentException("address 不能为空");
-        }
-        RiskPropagationService.GraphView view = snapshotView(asOf);
+        String cleanAddress = QueryValidator.requireAddress(address);
+        long validAsOf = QueryValidator.requireAsOf(asOf);
+        RiskPropagationService.GraphView view = snapshotView(validAsOf);
 
         long totalInflow = 0L;
         long totalOutflow = 0L;
@@ -34,19 +34,19 @@ public class FundFlowService {
         List<String> outflow = new java.util.ArrayList<>();
 
         for (Transaction tx : view.transactions) {
-            if (address.equals(tx.toAddress())) {
+            if (cleanAddress.equals(tx.toAddress())) {
                 totalInflow += tx.amount();
                 inflow.add(tx.txId());
             }
-            if (address.equals(tx.fromAddress())) {
+            if (cleanAddress.equals(tx.fromAddress())) {
                 totalOutflow += tx.amount();
                 outflow.add(tx.txId());
             }
         }
-        FundFlow flow = new FundFlow(address, asOf, totalInflow, totalOutflow,
+        FundFlow flow = new FundFlow(cleanAddress, validAsOf, totalInflow, totalOutflow,
                 List.copyOf(inflow), List.copyOf(outflow));
         log.info("资金追踪 address={}, asOf={}, 流入={} 笔共{}, 流出={} 笔共{}",
-                address, asOf, inflow.size(), totalInflow, outflow.size(), totalOutflow);
+                cleanAddress, validAsOf, inflow.size(), totalInflow, outflow.size(), totalOutflow);
         return flow;
     }
 

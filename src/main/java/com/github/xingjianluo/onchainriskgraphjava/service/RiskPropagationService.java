@@ -6,6 +6,7 @@ import com.github.xingjianluo.onchainriskgraphjava.model.RiskLabel;
 import com.github.xingjianluo.onchainriskgraphjava.model.RiskPath;
 import com.github.xingjianluo.onchainriskgraphjava.model.RuleVersion;
 import com.github.xingjianluo.onchainriskgraphjava.model.Transaction;
+import com.github.xingjianluo.onchainriskgraphjava.query.QueryValidator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -19,7 +20,6 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.TreeSet;
 
@@ -76,12 +76,34 @@ public class RiskPropagationService {
                 List.copyOf(nodes));
     }
 
-    /** 在 asOf 时点的快照上评估某地址风险 */
+    /**
+     * 在 asOf 时点的快照上评估某地址风险（默认语义）。
+     * 规则版本自动选取 {@code effectiveAt <= asOf} 的最新版本；
+     * 时间点前没有任何生效规则时抛出 {@link
+     * com.github.xingjianluo.onchainriskgraphjava.query.QueryNotFoundException}
+     * （原因码 {@code NO_EFFECTIVE_RULE}，仍是 {@link java.util.NoSuchElementException} 子类）。
+     */
     public RiskConclusion evaluate(String address, long asOf) {
-        if (address == null || address.isBlank()) {
-            throw new IllegalArgumentException("address 不能为空");
-        }
-        RuleVersion rule = ruleAt(asOf);
+        String cleanAddress = QueryValidator.requireAddress(address);
+        long validAsOf = QueryValidator.requireAsOf(asOf);
+        RuleVersion rule = ruleService.requireRuleAt(validAsOf);
+        return evaluateWithRule(cleanAddress, validAsOf, rule, false);
+    }
+
+    /**
+     * 在 asOf 时点的快照上，<b>显式指定一个已经发布过的规则版本</b>复现结论。
+     * 数据快照（交易/标记可见性）仍只取 asOf（含）之前；规则则严格使用指定版本，
+     * 不随时间点自动选择，也不会被之后发布的新版本带偏。
+     */
+    public RiskConclusion evaluate(String address, long asOf, int version) {
+        String cleanAddress = QueryValidator.requireAddress(address);
+        long validAsOf = QueryValidator.requireAsOf(asOf);
+        RuleVersion rule = ruleService.requireVersion(version);
+        return evaluateWithRule(cleanAddress, validAsOf, rule, true);
+    }
+
+    private RiskConclusion evaluateWithRule(String address, long asOf, RuleVersion rule,
+                                            boolean pinnedVersion) {
         List<RiskLabel> labels = labelRegistry.effectiveLabels(asOf);
         GraphView view = buildSnapshot(asOf);
 
@@ -101,13 +123,26 @@ public class RiskPropagationService {
         RiskConclusion conclusion = new RiskConclusion(address, asOf, score, risky,
                 rule.version(), rule.riskThreshold(), List.copyOf(contributions));
 
-        logConclusion(conclusion);
+        logConclusion(conclusion, pinnedVersion);
         return conclusion;
     }
 
-    /** 某时点全部相关地址（图节点 ∪ 风险源）的风险结论，按地址字典序 */
+    /** 某时点全部相关地址（图节点 ∪ 风险源）的风险结论，按地址字典序（默认时间点语义） */
     public List<RiskConclusion> evaluateAll(long asOf) {
-        RuleVersion rule = ruleAt(asOf);
+        long validAsOf = QueryValidator.requireAsOf(asOf);
+        RuleVersion rule = ruleService.requireRuleAt(validAsOf);
+        return evaluateAllWithRule(validAsOf, rule, false);
+    }
+
+    /** 某时点全部相关地址的风险结论，显式指定规则版本复现 */
+    public List<RiskConclusion> evaluateAll(long asOf, int version) {
+        long validAsOf = QueryValidator.requireAsOf(asOf);
+        RuleVersion rule = ruleService.requireVersion(version);
+        return evaluateAllWithRule(validAsOf, rule, true);
+    }
+
+    private List<RiskConclusion> evaluateAllWithRule(long asOf, RuleVersion rule,
+                                                     boolean pinnedVersion) {
         List<RiskLabel> labels = labelRegistry.effectiveLabels(asOf);
         GraphView view = buildSnapshot(asOf);
 
@@ -134,7 +169,8 @@ public class RiskPropagationService {
             all.add(new RiskConclusion(address, asOf, score, score >= rule.riskThreshold(),
                     rule.version(), rule.riskThreshold(), List.copyOf(contributions)));
         }
-        log.info("快照 t={} 全量风险评估完成，地址数={}, 规则=v{}", asOf, all.size(), rule.version());
+        log.info("快照 t={} 全量风险评估完成，地址数={}, 规则=v{}{}", asOf, all.size(),
+                rule.version(), pinnedVersion ? "(显式指定回放)" : "(时间点自动选取)");
         return List.copyOf(all);
     }
 
@@ -193,15 +229,11 @@ public class RiskPropagationService {
         return Math.min(1.0d, Math.max(0.0d, score));
     }
 
-    private RuleVersion ruleAt(long asOf) {
-        return ruleService.ruleAt(asOf).orElseThrow(() -> new NoSuchElementException(
-                "时间点 " + asOf + " 没有可用的风险规则版本，无法评估"));
-    }
-
-    private void logConclusion(RiskConclusion c) {
-        log.info("风险判定 address={}, asOf={}, score={}, risky={}, 规则=v{}, 阈值={}",
+    private void logConclusion(RiskConclusion c, boolean pinnedVersion) {
+        log.info("风险判定 address={}, asOf={}, score={}, risky={}, 规则=v{}{}, 阈值={}",
                 c.address(), c.asOf(), fmt(c.riskScore()), c.risky(),
-                c.ruleVersion(), c.riskThreshold());
+                c.ruleVersion(), pinnedVersion ? "(显式指定回放)" : "(时间点自动选取)",
+                c.riskThreshold());
         if (c.contributions().isEmpty()) {
             log.info("  判定依据: 地址 {} 在 t={} 无任何可达风险源，score=0", c.address(), c.asOf());
         }

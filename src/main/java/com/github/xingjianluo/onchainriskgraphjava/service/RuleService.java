@@ -1,8 +1,10 @@
 package com.github.xingjianluo.onchainriskgraphjava.service;
 
+import com.github.xingjianluo.onchainriskgraphjava.model.RejectReason;
 import com.github.xingjianluo.onchainriskgraphjava.model.RuleVersion;
 import com.github.xingjianluo.onchainriskgraphjava.model.SubmitResult;
 import com.github.xingjianluo.onchainriskgraphjava.model.SubmitStatus;
+import com.github.xingjianluo.onchainriskgraphjava.query.QueryNotFoundException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -60,6 +62,30 @@ public class RuleService {
         return versions.stream()
                 .filter(r -> r.effectiveAt() <= asOf)
                 .max(Comparator.comparingInt(RuleVersion::version));
+    }
+
+    /**
+     * 某时间点适用的规则版本；不存在时抛出携带稳定原因码
+     * {@link RejectReason#NO_EFFECTIVE_RULE} 的异常（仍是 {@link java.util.NoSuchElementException} 子类，
+     * 与既有直接调用方的断言兼容）。
+     */
+    public synchronized RuleVersion requireRuleAt(long asOf) {
+        return ruleAt(asOf).orElseThrow(() -> new QueryNotFoundException(
+                RejectReason.NO_EFFECTIVE_RULE,
+                "时间点 " + asOf + " 之前没有任何已生效的风险规则版本，无法评估"));
+    }
+
+    /**
+     * 按版本号显式取一个已经发布过的规则版本（版本回放/对比用）。
+     * 版本不存在时抛出 {@link RejectReason#UNKNOWN_RULE_VERSION}。
+     */
+    public synchronized RuleVersion requireVersion(int version) {
+        if (version < 1 || version > versions.size()) {
+            throw new QueryNotFoundException(RejectReason.UNKNOWN_RULE_VERSION,
+                    "规则版本 v" + version + " 不存在；当前已发布 "
+                            + versions.size() + " 个版本");
+        }
+        return versions.get(version - 1);
     }
 
     public synchronized int currentVersionNumber() {

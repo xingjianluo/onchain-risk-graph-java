@@ -68,7 +68,48 @@
   **规则变更只影响其生效后的判定，历史结论永远按当时版本复现。**
 - 非法取值（`maxHops<0`、`decay∉(0,1]`、`threshold∉(0,1]`）返回 `REJECTED_INVALID`。
 - 启动时若 `risk.*` 配置无法生成初始版本，应用直接启动失败；若查询时点没有任何规则版本，
-  评估抛出异常而不是返回静默的默认结论。
+  评估返回可解释拒绝（见第 8 节 `NO_EFFECTIVE_RULE`），而不是静默的默认结论。
+
+### 规则版本回放与影响对比（新增）
+
+- **显式版本回放**：风险查询增加可选参数 `ruleVersion`。给定后，数据快照仍只取
+  `asOf`（含）之前可见的交易/标记，但规则**严格使用该已发布版本**，不按时间点自动选择。
+  - 指定旧版本复现历史：结果与当时结论一致，**不会被之后发布的版本带偏**；
+  - 指定新版本复现历史：同一批历史数据是否翻盘一目了然；
+  - 指定不存在的版本：拒绝 `UNKNOWN_RULE_VERSION`（404）；
+  - **不传 `ruleVersion` 时行为与旧接口完全一致**（仍按 `effectiveAt <= asOf` 自动选版本）。
+- **双版本差异对比** `GET /api/risk/diff`：同一 `asOf` 给 `versionA/versionB`，
+  直接列出三类差异（可选 `address` 只对比单地址，否则对比快照内全部地址）：
+  - `becameRisky`：A 正常 → B 高风险（**新升高风险**）；
+  - `becameSafe`：A 高风险 → B 正常（**解除**）；
+  - `scoreOnlyChanged`：判定未翻转但分值变化（每条含 `scoreDelta` 与两版完整路径依据）。
+
+### 批量历史回放（新增）
+
+- `POST /api/risk/replay` 一次给一组点位 `{"points":[{"address","asOf"}, ...]}`，
+  点位串行、按请求顺序评估，返回顺序与请求**严格一致**；
+- 每个点位独立取 `asOf` 快照，结论与对应的单点查询（单地址或全量）**逐字段一致**；
+  单点位地址缺省表示该时点全量；单次最多 `500` 个点位；
+- 回放期间并发写入的更晚交易、更晚生效标记、更晚发布的规则，
+  对**已经过去的时间点不可见**——那个时点看不到的写入，回放时也不会被算进来。
+
+### 边界查询的可解释拒绝（新增）
+
+查询类边界情况统一返回 JSON `{"reasonCode","reason","message"}`，
+原因码稳定、彼此可区分，HTTP 状态固定；正常查询路径不受影响：
+
+| reasonCode | HTTP | 触发情况 |
+| --- | --- | --- |
+| `BLANK_ADDRESS` | 400 | 地址为 null、空串或仅空白 |
+| `MISSING_AS_OF` | 400 | 缺少必填的 `asOf` |
+| `INVALID_AS_OF` | 400 | `asOf` 为负数或不可解析 |
+| `INVALID_PARAMETER` | 400 | 其它参数缺失/类型错误（含对比接口缺版本参数、请求体坏 JSON） |
+| `INVALID_BATCH` | 400 | 批量点位为空、缺 `asOf`、`asOf` 负或点位超过 500 |
+| `UNKNOWN_RULE_VERSION` | 404 | 显式指定的规则版本不存在或版本号非法 |
+| `NO_EFFECTIVE_RULE` | 404 | 该时间点之前没有任何已生效的规则版本 |
+
+服务层异常仍继承 `IllegalArgumentException` / `NoSuchElementException`，
+旧的直接调用方（含老测试）不断言回归。
 
 ---
 
@@ -92,8 +133,10 @@
 | POST | `/api/transactions` | 交易入账（幂等） |
 | POST | `/api/labels` | 登记风险标记（幂等） |
 | POST | `/api/rules` | 发布新规则版本（严格递增、校验合法性） |
-| GET  | `/api/risk/{address}?asOf=` | 单地址风险结论（含路径） |
-| GET  | `/api/risk?asOf=` | 该时点全部地址风险结论 |
+| GET  | `/api/risk/{address}?asOf=&ruleVersion=` | 单地址风险结论（含路径）；`ruleVersion` 可选，显式版本回放 |
+| GET  | `/api/risk?asOf=&ruleVersion=` | 该时点全部地址风险结论；`ruleVersion` 可选 |
+| GET  | `/api/risk/diff?asOf=&versionA=&versionB=&address=` | 两个规则版本的判定差异对比（`address` 可选） |
+| POST | `/api/risk/replay` | 批量历史回放（点位数组，顺序稳定） |
 | GET  | `/api/funds/{address}?asOf=` | 资金流入/流出汇总 |
 
 示例：
@@ -107,6 +150,25 @@ curl 'localhost:8080/api/risk/B?asOf=100'
 curl 'localhost:8080/api/funds/B?asOf=100'
 curl -X POST localhost:8080/api/rules -H 'Content-Type: application/json' \
   -d '{"maxHops":2,"decay":0.5,"riskThreshold":0.3,"effectiveAt":500}'
+
+# 用已发布的 v1 在历史时点复现结论（不随时间点自动选版本）
+curl 'localhost:8080/api/risk/B?asOf=100&ruleVersion=1'
+# 同一时点 v1 vs v2 的影响对比：谁新升高风险、谁解除、分值各变多少
+curl 'localhost:8080/api/risk/diff?asOf=400&versionA=1&versionB=2'
+# 只对比单地址
+curl 'localhost:8080/api/risk/diff?asOf=400&versionA=1&versionB=2&address=B'
+# 批量历史回放（address 缺省表示该时点全量）
+curl -X POST localhost:8080/api/risk/replay -H 'Content-Type: application/json' \
+  -d '{"points":[{"asOf":50},{"address":"B","asOf":150},{"address":"B","asOf":400}]}'
+```
+
+边界拒绝示例：
+
+```bash
+curl -i 'localhost:8080/api/risk/B'                 # 400 MISSING_AS_OF
+curl -i 'localhost:8080/api/risk/B?asOf=-1'        # 400 INVALID_AS_OF
+curl -i 'localhost:8080/api/risk/B?asOf=10&ruleVersion=9'  # 404 UNKNOWN_RULE_VERSION
+# => {"reasonCode":"MISSING_AS_OF","reason":"MISSING_AS_OF","message":"缺少必填参数 asOf（快照时间点，毫秒）"}
 ```
 
 ---
@@ -121,7 +183,22 @@ mvn test
 | --- | --- |
 | `IdempotencyTest` | 20 线程并发重复同一笔交易：恰好 1 次 ACCEPTED、19 次 DUPLICATE、资金流只计一次；同标识内容冲突返回 REJECTED_CONFLICT 且消息含差异字段；非法交易 REJECTED_INVALID |
 | `CyclePropagationTest` | 自环 `B->B` 与环路 `B->C->B`：无无限传播、无重复累加；A/B/C 分值分别为 1.0/0.5/0.25；路径与交易序列可回溯；重复计算结论稳定 |
-| `SnapshotReplayTest` | 不同时间点快照隔离、未来写入不影响历史、noisy-OR 多源聚合、规则 v2 不重写历史、非法/冲突规则不生效、无规则时点显式失败 |
+| `SnapshotReplayTest` | 不同时间点快照隔离、未来写入不影响历史、noisy-OR 多源聚合、规则 v2 不重写历史、非法/冲突规则不生效、无规则时点显式失败（老用例，持续不回归） |
+| `RuleVersionReplayTest` | **显式旧版本回放与当时历史结论一致、不被后发布版本带偏；指定新版本复现历史可翻盘；最新版本时点结果不被算错；v1↔v2↔v3 差异对比列出新升高风险/解除/分值变化（含分值增量与两侧路径依据）；未知版本拒绝** |
+| `BoundaryRejectionServiceTest` | **服务层：空白地址、负 asOf、无生效规则、未知版本、空批次等拒绝彼此可区分，且兼容旧异常父类型** |
+| `BoundaryRejectionHttpTest` | **HTTP 层：BLANK_ADDRESS / MISSING_AS_OF / INVALID_AS_OF / INVALID_PARAMETER / INVALID_BATCH / UNKNOWN_RULE_VERSION / NO_EFFECTIVE_RULE 各自状态码与原因码稳定可区分，正常查询仍 200** |
+| `BatchReplayTest` | **批量回放逐点位与单点查询逐字段一致、返回顺序随请求稳定；3 个写线程持续入账/登记/发布规则期间，历史点位回放 20 轮结论全部不变；空批次/缺 asOf/超上限拒绝** |
 | `ApplicationTests` | Spring 全链路 HTTP 语义（200/409/400）、快照风险评估与资金追踪 |
 
-测试日志（`logs/` 或控制台）会打印：**交易流水清单、各地址风险判定、每条传播路径与贡献来源、noisy-OR 聚合与阈值比较的判定依据**。
+测试日志同时输出到控制台与 `logs/tests.log`，可看到：
+**覆盖了哪些场景（`========== 场景N ... ==========` / `[边界N]`）、每条用例的输入结果、
+新回放场景的判定依据（显式版本/阈值、传播路径、贡献分公式 `base*decay^hops`、
+新升高风险/解除清单及 noisy-OR 与阈值比较）**。
+
+### 本地手工验证（启动后）
+
+```bash
+mvn spring-boot:run
+# 另一个终端：按第 6 节示例依次执行入账/标记/发布规则/版本回放/版本对比/批量回放，
+# 再用缺 asOf、负 asOf、未知 ruleVersion 等请求观察 7 类可区分拒绝。
+```
