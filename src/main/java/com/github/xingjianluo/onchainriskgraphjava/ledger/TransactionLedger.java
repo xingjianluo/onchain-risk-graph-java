@@ -11,6 +11,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 内存交易账本：以 txId 为幂等键，线程安全地保存交易流水。
@@ -29,6 +30,9 @@ public class TransactionLedger {
     private static final Logger log = LoggerFactory.getLogger(TransactionLedger.class);
 
     private final ConcurrentMap<String, Transaction> byTxId = new ConcurrentHashMap<>();
+    /** 入账顺序号（单调递增），用于批量回放时截取一致的账本视图 */
+    private final AtomicLong ingestSeq = new AtomicLong(0L);
+    private final ConcurrentMap<String, Long> seqByTxId = new ConcurrentHashMap<>();
 
     public SubmitResult<Transaction> submit(Transaction tx) {
         String invalid = validate(tx);
@@ -39,6 +43,7 @@ public class TransactionLedger {
 
         Transaction existing = byTxId.putIfAbsent(tx.txId(), tx);
         if (existing == null) {
+            seqByTxId.put(tx.txId(), ingestSeq.incrementAndGet());
             log.info("交易入账成功 txId={}, {} -> {}, amount={}, visibleAt={}",
                     tx.txId(), tx.fromAddress(), tx.toAddress(), tx.amount(), tx.visibleAt());
             return new SubmitResult<>(SubmitStatus.ACCEPTED, "交易首次入账", tx);
@@ -58,11 +63,25 @@ public class TransactionLedger {
 
     /** 截至 asOf（含）可见的全部交易，按 (visibleAt, txId) 确定性排序 */
     public List<Transaction> visibleTransactions(long asOf) {
+        return visibleTransactions(asOf, Long.MAX_VALUE);
+    }
+
+    /**
+     * 截至 asOf（含）可见、且入账顺序号不超过 maxSeq 的交易。
+     * 批量回放用 maxSeq 锁住开始时刻的账本视图，回放期间的新入账不会被算进来。
+     */
+    public List<Transaction> visibleTransactions(long asOf, long maxSeq) {
         return byTxId.values().stream()
                 .filter(t -> t.visibleAt() <= asOf)
+                .filter(t -> seqByTxId.getOrDefault(t.txId(), Long.MAX_VALUE) <= maxSeq)
                 .sorted(Comparator.comparingLong(Transaction::visibleAt)
                         .thenComparing(Transaction::txId))
                 .toList();
+    }
+
+    /** 当前已入账的最大顺序号（批量回放开始时截取） */
+    public long currentSeq() {
+        return ingestSeq.get();
     }
 
     public int visibleCount(long asOf) {

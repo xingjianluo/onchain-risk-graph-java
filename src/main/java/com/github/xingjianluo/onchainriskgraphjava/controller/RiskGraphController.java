@@ -1,18 +1,25 @@
 package com.github.xingjianluo.onchainriskgraphjava.controller;
 
 import com.github.xingjianluo.onchainriskgraphjava.controller.dto.LabelRequest;
+import com.github.xingjianluo.onchainriskgraphjava.controller.dto.ReplayRequest;
 import com.github.xingjianluo.onchainriskgraphjava.controller.dto.RuleRequest;
 import com.github.xingjianluo.onchainriskgraphjava.controller.dto.TransactionRequest;
 import com.github.xingjianluo.onchainriskgraphjava.ledger.TransactionLedger;
 import com.github.xingjianluo.onchainriskgraphjava.model.FundFlow;
+import com.github.xingjianluo.onchainriskgraphjava.model.QueryOutcome;
+import com.github.xingjianluo.onchainriskgraphjava.model.QueryRejectReason;
+import com.github.xingjianluo.onchainriskgraphjava.model.QueryRejection;
+import com.github.xingjianluo.onchainriskgraphjava.model.ReplayItem;
 import com.github.xingjianluo.onchainriskgraphjava.model.RiskConclusion;
 import com.github.xingjianluo.onchainriskgraphjava.model.RiskLabel;
+import com.github.xingjianluo.onchainriskgraphjava.model.RuleDiffResult;
 import com.github.xingjianluo.onchainriskgraphjava.model.SubmitResult;
 import com.github.xingjianluo.onchainriskgraphjava.model.SubmitStatus;
 import com.github.xingjianluo.onchainriskgraphjava.model.Transaction;
 import com.github.xingjianluo.onchainriskgraphjava.service.FundFlowService;
 import com.github.xingjianluo.onchainriskgraphjava.service.RiskLabelRegistry;
 import com.github.xingjianluo.onchainriskgraphjava.service.RiskPropagationService;
+import com.github.xingjianluo.onchainriskgraphjava.service.RiskReplayService;
 import com.github.xingjianluo.onchainriskgraphjava.service.RuleService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -39,17 +46,20 @@ public class RiskGraphController {
     private final RuleService ruleService;
     private final RiskPropagationService propagationService;
     private final FundFlowService fundFlowService;
+    private final RiskReplayService replayService;
 
     public RiskGraphController(TransactionLedger ledger,
                                RiskLabelRegistry labelRegistry,
                                RuleService ruleService,
                                RiskPropagationService propagationService,
-                               FundFlowService fundFlowService) {
+                               FundFlowService fundFlowService,
+                               RiskReplayService replayService) {
         this.ledger = ledger;
         this.labelRegistry = labelRegistry;
         this.ruleService = ruleService;
         this.propagationService = propagationService;
         this.fundFlowService = fundFlowService;
+        this.replayService = replayService;
     }
 
     @PostMapping("/transactions")
@@ -81,9 +91,17 @@ public class RiskGraphController {
                 request.riskThreshold(), request.effectiveAt()));
     }
 
+    /**
+     * 单地址风险结论。可选 ruleVersion 显式指定已发布规则版本复现结论；
+     * 不指定时保持原有时间点语义。边界问题返回可机读的拒绝原因。
+     */
     @GetMapping("/risk/{address}")
-    public RiskConclusion risk(@PathVariable String address, @RequestParam long asOf) {
-        return propagationService.evaluate(address, asOf);
+    public ResponseEntity<?> risk(@PathVariable String address,
+                                  @RequestParam long asOf,
+                                  @RequestParam(required = false) Integer ruleVersion) {
+        QueryOutcome<RiskConclusion> outcome =
+                propagationService.evaluateOutcome(address, asOf, ruleVersion, null);
+        return outcome.isOk() ? ResponseEntity.ok(outcome.payload()) : rejected(outcome.rejection());
     }
 
     @GetMapping("/risk")
@@ -91,9 +109,43 @@ public class RiskGraphController {
         return propagationService.evaluateAll(asOf);
     }
 
+    /** 规则版本对比：同一时间点两个已发布版本的判定差异 */
+    @GetMapping("/risk/compare")
+    public ResponseEntity<?> compare(@RequestParam long asOf,
+                                     @RequestParam int baseVersion,
+                                     @RequestParam int targetVersion) {
+        QueryOutcome<RuleDiffResult> outcome = replayService.compare(asOf, baseVersion, targetVersion);
+        return outcome.isOk() ? ResponseEntity.ok(outcome.payload()) : rejected(outcome.rejection());
+    }
+
+    /**
+     * 批量历史回放：一组时间点一次回放，结果与逐点单查完全一致、顺序与请求一致。
+     * 回放期间的新入账/新标记/新规则不会进入本批结果。
+     */
+    @PostMapping("/risk/replay")
+    public ResponseEntity<?> replay(@RequestBody(required = false) ReplayRequest request) {
+        if (request == null || request.asOfs() == null || request.asOfs().isEmpty()) {
+            return rejected(new QueryRejection(QueryRejectReason.EMPTY_REPLAY_REQUEST,
+                    "批量回放请求不完整：address 与 asOfs（非空）均必填"));
+        }
+        List<ReplayItem> items = replayService.replay(
+                request.address(), request.asOfs(), request.ruleVersion());
+        return ResponseEntity.ok(items);
+    }
+
     @GetMapping("/funds/{address}")
-    public FundFlow funds(@PathVariable String address, @RequestParam long asOf) {
-        return fundFlowService.summarize(address, asOf);
+    public ResponseEntity<?> funds(@PathVariable String address, @RequestParam long asOf) {
+        QueryOutcome<FundFlow> outcome = fundFlowService.summarizeOutcome(address, asOf);
+        return outcome.isOk() ? ResponseEntity.ok(outcome.payload()) : rejected(outcome.rejection());
+    }
+
+    /** 查询拒绝的 HTTP 映射：入参非法 400；状态相关（无生效规则/版本不存在/空回放）422 */
+    private static ResponseEntity<QueryRejection> rejected(QueryRejection rejection) {
+        int code = switch (rejection.reason()) {
+            case INVALID_ADDRESS, INVALID_AS_OF, INVALID_RULE_VERSION -> 400;
+            case UNKNOWN_RULE_VERSION, NO_EFFECTIVE_RULE, EMPTY_REPLAY_REQUEST -> 422;
+        };
+        return ResponseEntity.status(code).body(rejection);
     }
 
     private static ResponseEntity<SubmitResult<?>> badRequest(String message) {

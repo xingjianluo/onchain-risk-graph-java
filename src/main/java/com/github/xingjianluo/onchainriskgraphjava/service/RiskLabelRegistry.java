@@ -11,6 +11,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 风险地址标记注册表（内存、线程安全）。
@@ -22,6 +23,9 @@ public class RiskLabelRegistry {
     private static final Logger log = LoggerFactory.getLogger(RiskLabelRegistry.class);
 
     private final ConcurrentMap<String, RiskLabel> byAddress = new ConcurrentHashMap<>();
+    /** 登记顺序号（单调递增），用于批量回放时截取一致的标记视图 */
+    private final AtomicLong registerSeq = new AtomicLong(0L);
+    private final ConcurrentMap<String, Long> seqByAddress = new ConcurrentHashMap<>();
 
     public SubmitResult<RiskLabel> register(RiskLabel label) {
         String invalid = validate(label);
@@ -32,6 +36,7 @@ public class RiskLabelRegistry {
 
         RiskLabel existing = byAddress.putIfAbsent(label.address(), label);
         if (existing == null) {
+            seqByAddress.put(label.address(), registerSeq.incrementAndGet());
             log.info("风险标记登记成功 address={}, baseScore={}, effectiveAt={}",
                     label.address(), label.baseScore(), label.effectiveAt());
             return new SubmitResult<>(SubmitStatus.ACCEPTED, "风险标记首次登记", label);
@@ -50,10 +55,24 @@ public class RiskLabelRegistry {
     }
 
     public List<RiskLabel> effectiveLabels(long asOf) {
+        return effectiveLabels(asOf, Long.MAX_VALUE);
+    }
+
+    /**
+     * 截至 asOf（含）已生效、且登记顺序号不超过 maxSeq 的标记。
+     * 批量回放用 maxSeq 锁住开始时刻的标记视图，回放期间新登记的标记不会被算进来。
+     */
+    public List<RiskLabel> effectiveLabels(long asOf, long maxSeq) {
         return byAddress.values().stream()
                 .filter(l -> l.effectiveAt() <= asOf)
+                .filter(l -> seqByAddress.getOrDefault(l.address(), Long.MAX_VALUE) <= maxSeq)
                 .sorted(Comparator.comparing(RiskLabel::address))
                 .toList();
+    }
+
+    /** 当前已登记的最大顺序号（批量回放开始时截取） */
+    public long currentSeq() {
+        return registerSeq.get();
     }
 
     private static String validate(RiskLabel label) {

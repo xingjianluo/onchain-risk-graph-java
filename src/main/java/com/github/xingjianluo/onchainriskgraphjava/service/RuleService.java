@@ -57,9 +57,26 @@ public class RuleService {
 
     /** 某时间点适用的规则版本（effectiveAt <= asOf 的最新版本） */
     public synchronized Optional<RuleVersion> ruleAt(long asOf) {
+        return ruleAt(asOf, Integer.MAX_VALUE);
+    }
+
+    /**
+     * 某时间点适用的规则版本，但只考虑版本号不超过 maxVersion 的已发布版本。
+     * 批量回放用 maxVersion 锁住开始时刻的规则线，回放期间新发布的版本不会被算进来。
+     */
+    public synchronized Optional<RuleVersion> ruleAt(long asOf, int maxVersion) {
         return versions.stream()
+                .filter(r -> r.version() <= maxVersion)
                 .filter(r -> r.effectiveAt() <= asOf)
                 .max(Comparator.comparingInt(RuleVersion::version));
+    }
+
+    /** 按版本号取某个已发布的不可变版本（用于显式指定版本复现/对比） */
+    public synchronized Optional<RuleVersion> version(int version) {
+        if (version < 1 || version > versions.size()) {
+            return Optional.empty();
+        }
+        return Optional.of(versions.get(version - 1));
     }
 
     public synchronized int currentVersionNumber() {

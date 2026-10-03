@@ -1,6 +1,9 @@
 package com.github.xingjianluo.onchainriskgraphjava.service;
 
 import com.github.xingjianluo.onchainriskgraphjava.ledger.TransactionLedger;
+import com.github.xingjianluo.onchainriskgraphjava.model.QueryOutcome;
+import com.github.xingjianluo.onchainriskgraphjava.model.QueryRejectReason;
+import com.github.xingjianluo.onchainriskgraphjava.model.QueryRejection;
 import com.github.xingjianluo.onchainriskgraphjava.model.RiskConclusion;
 import com.github.xingjianluo.onchainriskgraphjava.model.RiskLabel;
 import com.github.xingjianluo.onchainriskgraphjava.model.RiskPath;
@@ -20,6 +23,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 
@@ -57,7 +61,12 @@ public class RiskPropagationService {
 
     /** 构建仅含 asOf（含）之前可见交易的不可变图视图 */
     public GraphView buildSnapshot(long asOf) {
-        List<Transaction> txs = ledger.visibleTransactions(asOf);
+        return buildSnapshot(asOf, ReplayScope.unbounded());
+    }
+
+    /** 在指定回放边界内构建仅含 asOf（含）之前可见交易的不可变图视图 */
+    public GraphView buildSnapshot(long asOf, ReplayScope scope) {
+        List<Transaction> txs = ledger.visibleTransactions(asOf, scope.txSeq());
         Map<String, List<Edge>> outgoing = new HashMap<>();
         Set<String> nodes = new TreeSet<>();
         for (Transaction tx : txs) {
@@ -76,14 +85,72 @@ public class RiskPropagationService {
                 List.copyOf(nodes));
     }
 
+    /** 截取当前时刻的一致性回放边界（账本/标记/规则三线同时定格） */
+    public ReplayScope captureScope() {
+        return new ReplayScope(ledger.currentSeq(), labelRegistry.currentSeq(),
+                ruleService.currentVersionNumber());
+    }
+
     /** 在 asOf 时点的快照上评估某地址风险 */
     public RiskConclusion evaluate(String address, long asOf) {
         if (address == null || address.isBlank()) {
             throw new IllegalArgumentException("address 不能为空");
         }
         RuleVersion rule = ruleAt(asOf);
-        List<RiskLabel> labels = labelRegistry.effectiveLabels(asOf);
-        GraphView view = buildSnapshot(asOf);
+        return evaluateWith(address, asOf, rule, ReplayScope.unbounded());
+    }
+
+    /**
+     * 可解释拒绝版评估：不抛异常，非法入参/无生效规则/版本不存在都返回
+     * 携带稳定原因码的 {@link com.github.xingjianluo.onchainriskgraphjava.model.QueryRejection}。
+     *
+     * @param ruleVersion 显式指定的已发布规则版本；为 null 时按 asOf 时间点语义自动选取
+     * @param scope       回放边界；为 null 表示不限制（看到当前一切可见数据）
+     */
+    public QueryOutcome<RiskConclusion> evaluateOutcome(String address, long asOf,
+                                             Integer ruleVersion, ReplayScope scope) {
+        if (address == null || address.isBlank()) {
+            return reject(QueryRejectReason.INVALID_ADDRESS,
+                    "address 不能为空或全空白，实际: " + (address == null ? "null" : "'" + address + "'"));
+        }
+        if (asOf < 0) {
+            return reject(QueryRejectReason.INVALID_AS_OF,
+                    "asOf 不能为负数，实际: " + asOf);
+        }
+        ReplayScope s = scope == null ? ReplayScope.unbounded() : scope;
+        RuleVersion rule;
+        if (ruleVersion != null) {
+            if (ruleVersion <= 0) {
+                return reject(QueryRejectReason.INVALID_RULE_VERSION,
+                        "ruleVersion 必须为正整数，实际: " + ruleVersion);
+            }
+            Optional<RuleVersion> explicit = ruleService.version(ruleVersion);
+            if (explicit.isEmpty() || ruleVersion > s.maxRuleVersion()) {
+                return reject(QueryRejectReason.UNKNOWN_RULE_VERSION,
+                        "规则版本 v" + ruleVersion + " 不存在（当前已发布到 v"
+                                + Math.min(ruleService.currentVersionNumber(), s.maxRuleVersion()) + "）");
+            }
+            rule = explicit.get();
+        } else {
+            Optional<RuleVersion> atTime = ruleService.ruleAt(asOf, s.maxRuleVersion());
+            if (atTime.isEmpty()) {
+                return reject(QueryRejectReason.NO_EFFECTIVE_RULE,
+                        "时间点 " + asOf + " 之前没有任何已生效的规则版本，无法评估");
+            }
+            rule = atTime.get();
+        }
+        return QueryOutcome.ok(evaluateWith(address, asOf, rule, s));
+    }
+
+    private static QueryOutcome<RiskConclusion> reject(QueryRejectReason reason, String message) {
+        log.warn("查询被拒绝: reason={}, message={}", reason, message);
+        return QueryOutcome.rejected(new QueryRejection(reason, message));
+    }
+
+    /** 指定规则版本与回放边界的核心评估（纯读，不改状态） */
+    private RiskConclusion evaluateWith(String address, long asOf, RuleVersion rule, ReplayScope scope) {
+        List<RiskLabel> labels = labelRegistry.effectiveLabels(asOf, scope.labelSeq());
+        GraphView view = buildSnapshot(asOf, scope);
 
         List<RiskPath> contributions = new ArrayList<>();
         for (RiskLabel label : labels) {
@@ -107,9 +174,13 @@ public class RiskPropagationService {
 
     /** 某时点全部相关地址（图节点 ∪ 风险源）的风险结论，按地址字典序 */
     public List<RiskConclusion> evaluateAll(long asOf) {
-        RuleVersion rule = ruleAt(asOf);
-        List<RiskLabel> labels = labelRegistry.effectiveLabels(asOf);
-        GraphView view = buildSnapshot(asOf);
+        return evaluateAll(asOf, ruleAt(asOf), ReplayScope.unbounded());
+    }
+
+    /** 指定规则版本与回放边界的全量评估（用于版本对比与批量回放） */
+    public List<RiskConclusion> evaluateAll(long asOf, RuleVersion rule, ReplayScope scope) {
+        List<RiskLabel> labels = labelRegistry.effectiveLabels(asOf, scope.labelSeq());
+        GraphView view = buildSnapshot(asOf, scope);
 
         // 预先计算每个风险源的可达结果，避免重复搜索
         Map<String, Map<String, RiskPath>> bySource = new LinkedHashMap<>();
