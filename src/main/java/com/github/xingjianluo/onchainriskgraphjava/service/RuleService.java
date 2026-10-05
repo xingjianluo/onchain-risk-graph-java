@@ -1,5 +1,7 @@
 package com.github.xingjianluo.onchainriskgraphjava.service;
 
+import com.github.xingjianluo.onchainriskgraphjava.ledger.CommitClock;
+import com.github.xingjianluo.onchainriskgraphjava.ledger.Committed;
 import com.github.xingjianluo.onchainriskgraphjava.model.RejectReason;
 import com.github.xingjianluo.onchainriskgraphjava.model.RuleVersion;
 import com.github.xingjianluo.onchainriskgraphjava.model.SubmitResult;
@@ -7,6 +9,7 @@ import com.github.xingjianluo.onchainriskgraphjava.model.SubmitStatus;
 import com.github.xingjianluo.onchainriskgraphjava.query.QueryNotFoundException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -29,39 +32,68 @@ public class RuleService {
 
     private static final Logger log = LoggerFactory.getLogger(RuleService.class);
 
-    private final List<RuleVersion> versions = new ArrayList<>();
+    private final List<Committed<RuleVersion>> versions = new ArrayList<>();
+    private final CommitClock clock;
 
-    public synchronized SubmitResult<RuleVersion> publish(int maxHops, double decay,
-                                                          double riskThreshold, long effectiveAt) {
-        String invalid = validateParams(maxHops, decay, riskThreshold, effectiveAt);
-        if (invalid != null) {
-            log.warn("规则非法被拒绝: {}", invalid);
-            return new SubmitResult<>(SubmitStatus.REJECTED_INVALID, invalid, null);
-        }
-        if (!versions.isEmpty()) {
-            RuleVersion last = versions.get(versions.size() - 1);
-            if (effectiveAt <= last.effectiveAt()) {
-                String msg = "规则时间线冲突：新版本 effectiveAt=" + effectiveAt
-                        + " 必须严格晚于当前最新版本(v" + last.version()
-                        + ")的 effectiveAt=" + last.effectiveAt();
-                log.warn(msg);
-                return new SubmitResult<>(SubmitStatus.REJECTED_CONFLICT, msg, last);
-            }
-        }
-        RuleVersion rule = new RuleVersion(versions.size() + 1, effectiveAt,
-                maxHops, decay, riskThreshold);
-        versions.add(rule);
-        log.info("规则版本发布 v{}: effectiveAt={}, maxHops={}, decay={}, threshold={}",
-                rule.version(), rule.effectiveAt(), rule.maxHops(),
-                rule.decay(), rule.riskThreshold());
-        return new SubmitResult<>(SubmitStatus.ACCEPTED, "规则版本 v" + rule.version() + " 已发布", rule);
+    /** 兼容旧调用方：自带独立时钟（不与其他存储共享水位） */
+    public RuleService() {
+        this(new CommitClock());
     }
 
-    /** 某时间点适用的规则版本（effectiveAt <= asOf 的最新版本） */
-    public synchronized Optional<RuleVersion> ruleAt(long asOf) {
-        return versions.stream()
-                .filter(r -> r.effectiveAt() <= asOf)
-                .max(Comparator.comparingInt(RuleVersion::version));
+    @Autowired
+    public RuleService(CommitClock clock) {
+        this.clock = clock;
+    }
+
+    // 所有读写都同步在共享时钟上：发布（分配序号+落库）与批量回放的水位读取互斥，
+    // 保证水位两侧不会出现“半发布”的版本
+    public SubmitResult<RuleVersion> publish(int maxHops, double decay,
+                                             double riskThreshold, long effectiveAt) {
+        synchronized (clock) {
+            String invalid = validateParams(maxHops, decay, riskThreshold, effectiveAt);
+            if (invalid != null) {
+                log.warn("规则非法被拒绝: {}", invalid);
+                return new SubmitResult<>(SubmitStatus.REJECTED_INVALID, invalid, null);
+            }
+            if (!versions.isEmpty()) {
+                RuleVersion last = versions.get(versions.size() - 1).value();
+                if (effectiveAt <= last.effectiveAt()) {
+                    String msg = "规则时间线冲突：新版本 effectiveAt=" + effectiveAt
+                            + " 必须严格晚于当前最新版本(v" + last.version()
+                            + ")的 effectiveAt=" + last.effectiveAt();
+                    log.warn(msg);
+                    return new SubmitResult<>(SubmitStatus.REJECTED_CONFLICT, msg, last);
+                }
+            }
+            RuleVersion rule = new RuleVersion(versions.size() + 1, effectiveAt,
+                    maxHops, decay, riskThreshold);
+            versions.add(new Committed<>(clock.next(), rule));
+            log.info("规则版本发布 v{}: effectiveAt={}, maxHops={}, decay={}, threshold={}",
+                    rule.version(), rule.effectiveAt(), rule.maxHops(),
+                    rule.decay(), rule.riskThreshold());
+            return new SubmitResult<>(SubmitStatus.ACCEPTED,
+                    "规则版本 v" + rule.version() + " 已发布", rule);
+        }
+    }
+
+    /** 某时间点适用的规则版本（effectiveAt <= asOf 的最新版本，不限提交水位） */
+    public Optional<RuleVersion> ruleAt(long asOf) {
+        return ruleAt(asOf, Long.MAX_VALUE);
+    }
+
+    /**
+     * 某时间点适用、且提交序号不超过 {@code maxSeq} 的规则版本。
+     * 批量历史回放用批次开始时固定的水位调用本方法：回放期间新发布的版本
+     * （哪怕 effectiveAt 落在回放区间内）不会顶替该时点原本应选用的版本。
+     */
+    public Optional<RuleVersion> ruleAt(long asOf, long maxSeq) {
+        synchronized (clock) {
+            return versions.stream()
+                    .filter(c -> c.seq() <= maxSeq)
+                    .map(Committed::value)
+                    .filter(r -> r.effectiveAt() <= asOf)
+                    .max(Comparator.comparingInt(RuleVersion::version));
+        }
     }
 
     /**
@@ -69,8 +101,13 @@ public class RuleService {
      * {@link RejectReason#NO_EFFECTIVE_RULE} 的异常（仍是 {@link java.util.NoSuchElementException} 子类，
      * 与既有直接调用方的断言兼容）。
      */
-    public synchronized RuleVersion requireRuleAt(long asOf) {
-        return ruleAt(asOf).orElseThrow(() -> new QueryNotFoundException(
+    public RuleVersion requireRuleAt(long asOf) {
+        return requireRuleAt(asOf, Long.MAX_VALUE);
+    }
+
+    /** 带提交水位限制的 {@link #requireRuleAt(long)}，批量历史回放专用 */
+    public RuleVersion requireRuleAt(long asOf, long maxSeq) {
+        return ruleAt(asOf, maxSeq).orElseThrow(() -> new QueryNotFoundException(
                 RejectReason.NO_EFFECTIVE_RULE,
                 "时间点 " + asOf + " 之前没有任何已生效的风险规则版本，无法评估"));
     }
@@ -79,17 +116,21 @@ public class RuleService {
      * 按版本号显式取一个已经发布过的规则版本（版本回放/对比用）。
      * 版本不存在时抛出 {@link RejectReason#UNKNOWN_RULE_VERSION}。
      */
-    public synchronized RuleVersion requireVersion(int version) {
-        if (version < 1 || version > versions.size()) {
-            throw new QueryNotFoundException(RejectReason.UNKNOWN_RULE_VERSION,
-                    "规则版本 v" + version + " 不存在；当前已发布 "
-                            + versions.size() + " 个版本");
+    public RuleVersion requireVersion(int version) {
+        synchronized (clock) {
+            if (version < 1 || version > versions.size()) {
+                throw new QueryNotFoundException(RejectReason.UNKNOWN_RULE_VERSION,
+                        "规则版本 v" + version + " 不存在；当前已发布 "
+                                + versions.size() + " 个版本");
+            }
+            return versions.get(version - 1).value();
         }
-        return versions.get(version - 1);
     }
 
-    public synchronized int currentVersionNumber() {
-        return versions.size();
+    public int currentVersionNumber() {
+        synchronized (clock) {
+            return versions.size();
+        }
     }
 
     static String validateParams(int maxHops, double decay, double riskThreshold, long effectiveAt) {

@@ -38,13 +38,16 @@ class BoundaryRejectionHttpTest {
 
     @BeforeEach
     void setUp() {
-        TransactionLedger ledger = new TransactionLedger();
-        rules = new RuleService();
-        RiskLabelRegistry labels = new RiskLabelRegistry();
+        // 存储与批量回放共享同一个提交水位钟，与生产 Spring 装配一致
+        com.github.xingjianluo.onchainriskgraphjava.ledger.CommitClock clock =
+                new com.github.xingjianluo.onchainriskgraphjava.ledger.CommitClock();
+        TransactionLedger ledger = new TransactionLedger(clock);
+        rules = new RuleService(clock);
+        RiskLabelRegistry labels = new RiskLabelRegistry(clock);
         RiskPropagationService propagation = new RiskPropagationService(ledger, labels, rules);
         FundFlowService funds = new FundFlowService(propagation);
         RuleReplayService replay = new RuleReplayService(rules, propagation);
-        BatchReplayService batch = new BatchReplayService(propagation);
+        BatchReplayService batch = new BatchReplayService(propagation, clock);
         rules.publish(3, 0.5, 0.5, 100L); // v1 自 t=100 起生效
         mockMvc = MockMvcBuilders
                 .standaloneSetup(new RiskGraphController(ledger, labels, rules, propagation,

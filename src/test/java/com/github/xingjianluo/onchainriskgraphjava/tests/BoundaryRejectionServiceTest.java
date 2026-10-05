@@ -26,12 +26,14 @@ class BoundaryRejectionServiceTest {
 
     private static final Logger log = LoggerFactory.getLogger(BoundaryRejectionServiceTest.class);
 
-    private final RuleService rules = new RuleService();
-    private final RiskPropagationService propagation =
-            new RiskPropagationService(new TransactionLedger(), new RiskLabelRegistry(), rules);
+    private final com.github.xingjianluo.onchainriskgraphjava.ledger.CommitClock clock =
+            new com.github.xingjianluo.onchainriskgraphjava.ledger.CommitClock();
+    private final RuleService rules = new RuleService(clock);
+    private final RiskPropagationService propagation = new RiskPropagationService(
+            new TransactionLedger(clock), new RiskLabelRegistry(clock), rules);
     private final FundFlowService funds = new FundFlowService(propagation);
     private final RuleReplayService replay = new RuleReplayService(rules, propagation);
-    private final BatchReplayService batch = new BatchReplayService(propagation);
+    private final BatchReplayService batch = new BatchReplayService(propagation, clock);
 
     @Test
     void blankAddress_distinctReasons() {

@@ -50,11 +50,14 @@ class BatchReplayTest {
 
     @BeforeEach
     void setUp() {
-        ledger = new TransactionLedger();
-        rules = new RuleService();
-        labels = new RiskLabelRegistry();
+        // 三个存储与批量回放共享同一个提交水位钟，与生产 Spring 装配一致
+        com.github.xingjianluo.onchainriskgraphjava.ledger.CommitClock clock =
+                new com.github.xingjianluo.onchainriskgraphjava.ledger.CommitClock();
+        ledger = new TransactionLedger(clock);
+        rules = new RuleService(clock);
+        labels = new RiskLabelRegistry(clock);
         propagation = new RiskPropagationService(ledger, labels, rules);
-        batch = new BatchReplayService(propagation);
+        batch = new BatchReplayService(propagation, clock);
 
         assertEquals(SubmitStatus.ACCEPTED, rules.publish(3, 0.5, 0.5, 0L).status());
         labels.register(new RiskLabel("A", 1.0, 0L));

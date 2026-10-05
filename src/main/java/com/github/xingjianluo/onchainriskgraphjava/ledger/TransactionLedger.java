@@ -5,6 +5,7 @@ import com.github.xingjianluo.onchainriskgraphjava.model.SubmitStatus;
 import com.github.xingjianluo.onchainriskgraphjava.model.Transaction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.Comparator;
@@ -28,7 +29,18 @@ public class TransactionLedger {
 
     private static final Logger log = LoggerFactory.getLogger(TransactionLedger.class);
 
-    private final ConcurrentMap<String, Transaction> byTxId = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Committed<Transaction>> byTxId = new ConcurrentHashMap<>();
+    private final CommitClock clock;
+
+    /** 兼容旧调用方：自带独立时钟（不与其他存储共享水位） */
+    public TransactionLedger() {
+        this(new CommitClock());
+    }
+
+    @Autowired
+    public TransactionLedger(CommitClock clock) {
+        this.clock = clock;
+    }
 
     public SubmitResult<Transaction> submit(Transaction tx) {
         String invalid = validate(tx);
@@ -37,28 +49,44 @@ public class TransactionLedger {
             return new SubmitResult<>(SubmitStatus.REJECTED_INVALID, invalid, null);
         }
 
-        Transaction existing = byTxId.putIfAbsent(tx.txId(), tx);
+        // 分配提交序号与落库必须在同一临界区，保证批量回放的水位不会看到“半提交”状态
+        Committed<Transaction> existing;
+        synchronized (clock) {
+            existing = byTxId.putIfAbsent(tx.txId(), new Committed<>(clock.next(), tx));
+        }
         if (existing == null) {
             log.info("交易入账成功 txId={}, {} -> {}, amount={}, visibleAt={}",
                     tx.txId(), tx.fromAddress(), tx.toAddress(), tx.amount(), tx.visibleAt());
             return new SubmitResult<>(SubmitStatus.ACCEPTED, "交易首次入账", tx);
         }
 
-        if (existing.equals(tx)) {
+        if (existing.value().equals(tx)) {
             log.info("重复投递(内容一致)幂等忽略 txId={}", tx.txId());
             return new SubmitResult<>(SubmitStatus.DUPLICATE,
-                    "普通重复投递：交易 " + tx.txId() + " 已存在且内容一致，已幂等忽略", existing);
+                    "普通重复投递：交易 " + tx.txId() + " 已存在且内容一致，已幂等忽略", existing.value());
         }
 
-        String diff = describeDiff(existing, tx);
+        String diff = describeDiff(existing.value(), tx);
         log.warn("冲突被拒绝 txId={}, 差异={}", tx.txId(), diff);
         return new SubmitResult<>(SubmitStatus.REJECTED_CONFLICT,
-                "内容冲突：交易标识 " + tx.txId() + " 已存在但内容不一致 [" + diff + "]，拒绝写入", existing);
+                "内容冲突：交易标识 " + tx.txId() + " 已存在但内容不一致 [" + diff + "]，拒绝写入",
+                existing.value());
     }
 
-    /** 截至 asOf（含）可见的全部交易，按 (visibleAt, txId) 确定性排序 */
+    /** 截至 asOf（含）可见的全部交易，按 (visibleAt, txId) 确定性排序（不限提交水位） */
     public List<Transaction> visibleTransactions(long asOf) {
+        return visibleTransactions(asOf, Long.MAX_VALUE);
+    }
+
+    /**
+     * 截至 asOf（含）可见、且提交序号不超过 {@code maxSeq} 的全部交易。
+     * 批量历史回放用批次开始时固定的水位调用本方法：回放期间新入账的交易
+     * （哪怕 visibleAt 落在回放区间内）对整批不可见。
+     */
+    public List<Transaction> visibleTransactions(long asOf, long maxSeq) {
         return byTxId.values().stream()
+                .filter(c -> c.seq() <= maxSeq)
+                .map(Committed::value)
                 .filter(t -> t.visibleAt() <= asOf)
                 .sorted(Comparator.comparingLong(Transaction::visibleAt)
                         .thenComparing(Transaction::txId))
@@ -66,7 +94,9 @@ public class TransactionLedger {
     }
 
     public int visibleCount(long asOf) {
-        return (int) byTxId.values().stream().filter(t -> t.visibleAt() <= asOf).count();
+        return (int) byTxId.values().stream()
+                .map(Committed::value)
+                .filter(t -> t.visibleAt() <= asOf).count();
     }
 
     private static String validate(Transaction tx) {

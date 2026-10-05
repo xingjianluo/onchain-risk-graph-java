@@ -1,10 +1,13 @@
 package com.github.xingjianluo.onchainriskgraphjava.service;
 
+import com.github.xingjianluo.onchainriskgraphjava.ledger.CommitClock;
+import com.github.xingjianluo.onchainriskgraphjava.ledger.Committed;
 import com.github.xingjianluo.onchainriskgraphjava.model.RiskLabel;
 import com.github.xingjianluo.onchainriskgraphjava.model.SubmitResult;
 import com.github.xingjianluo.onchainriskgraphjava.model.SubmitStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.Comparator;
@@ -21,7 +24,18 @@ public class RiskLabelRegistry {
 
     private static final Logger log = LoggerFactory.getLogger(RiskLabelRegistry.class);
 
-    private final ConcurrentMap<String, RiskLabel> byAddress = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Committed<RiskLabel>> byAddress = new ConcurrentHashMap<>();
+    private final CommitClock clock;
+
+    /** 兼容旧调用方：自带独立时钟（不与其他存储共享水位） */
+    public RiskLabelRegistry() {
+        this(new CommitClock());
+    }
+
+    @Autowired
+    public RiskLabelRegistry(CommitClock clock) {
+        this.clock = clock;
+    }
 
     public SubmitResult<RiskLabel> register(RiskLabel label) {
         String invalid = validate(label);
@@ -30,27 +44,45 @@ public class RiskLabelRegistry {
             return new SubmitResult<>(SubmitStatus.REJECTED_INVALID, invalid, null);
         }
 
-        RiskLabel existing = byAddress.putIfAbsent(label.address(), label);
+        // 分配提交序号与落库必须在同一临界区，保证批量回放的水位不会看到“半提交”状态
+        Committed<RiskLabel> existing;
+        synchronized (clock) {
+            existing = byAddress.putIfAbsent(label.address(),
+                    new Committed<>(clock.next(), label));
+        }
         if (existing == null) {
             log.info("风险标记登记成功 address={}, baseScore={}, effectiveAt={}",
                     label.address(), label.baseScore(), label.effectiveAt());
             return new SubmitResult<>(SubmitStatus.ACCEPTED, "风险标记首次登记", label);
         }
-        if (existing.equals(label)) {
+        if (existing.value().equals(label)) {
             log.info("风险标记重复投递(内容一致)幂等忽略 address={}", label.address());
             return new SubmitResult<>(SubmitStatus.DUPLICATE,
-                    "普通重复投递：地址 " + label.address() + " 已被标记且内容一致，已幂等忽略", existing);
+                    "普通重复投递：地址 " + label.address() + " 已被标记且内容一致，已幂等忽略",
+                    existing.value());
         }
 
-        String diff = describeDiff(existing, label);
+        String diff = describeDiff(existing.value(), label);
         log.warn("风险标记冲突被拒绝 address={}, 差异={}", label.address(), diff);
         return new SubmitResult<>(SubmitStatus.REJECTED_CONFLICT,
                 "内容冲突：地址 " + label.address() + " 的风险标记已存在但内容不一致 ["
-                        + diff + "]，拒绝写入", existing);
+                        + diff + "]，拒绝写入", existing.value());
     }
 
+    /** 截至 asOf（含）已生效的全部风险标记（不限提交水位） */
     public List<RiskLabel> effectiveLabels(long asOf) {
+        return effectiveLabels(asOf, Long.MAX_VALUE);
+    }
+
+    /**
+     * 截至 asOf（含）已生效、且提交序号不超过 {@code maxSeq} 的风险标记。
+     * 批量历史回放用批次开始时固定的水位调用本方法：回放期间新登记的标记
+     * （哪怕 effectiveAt 落在回放区间内）对整批不可见。
+     */
+    public List<RiskLabel> effectiveLabels(long asOf, long maxSeq) {
         return byAddress.values().stream()
+                .filter(c -> c.seq() <= maxSeq)
+                .map(Committed::value)
                 .filter(l -> l.effectiveAt() <= asOf)
                 .sorted(Comparator.comparing(RiskLabel::address))
                 .toList();

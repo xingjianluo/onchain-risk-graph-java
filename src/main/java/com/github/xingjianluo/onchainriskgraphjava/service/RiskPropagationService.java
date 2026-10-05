@@ -55,9 +55,17 @@ public class RiskPropagationService {
         this.ruleService = ruleService;
     }
 
-    /** 构建仅含 asOf（含）之前可见交易的不可变图视图 */
+    /** 构建仅含 asOf（含）之前可见交易的不可变图视图（不限提交水位） */
     public GraphView buildSnapshot(long asOf) {
-        List<Transaction> txs = ledger.visibleTransactions(asOf);
+        return buildSnapshot(asOf, Long.MAX_VALUE);
+    }
+
+    /**
+     * 构建仅含 asOf（含）之前可见、且提交序号不超过 {@code maxSeq} 的交易的不可变图视图。
+     * 批量历史回放用批次开始时固定的水位调用，回放期间新入账的交易对整批不可见。
+     */
+    public GraphView buildSnapshot(long asOf, long maxSeq) {
+        List<Transaction> txs = ledger.visibleTransactions(asOf, maxSeq);
         Map<String, List<Edge>> outgoing = new HashMap<>();
         Set<String> nodes = new TreeSet<>();
         for (Transaction tx : txs) {
@@ -87,7 +95,19 @@ public class RiskPropagationService {
         String cleanAddress = QueryValidator.requireAddress(address);
         long validAsOf = QueryValidator.requireAsOf(asOf);
         RuleVersion rule = ruleService.requireRuleAt(validAsOf);
-        return evaluateWithRule(cleanAddress, validAsOf, rule, false);
+        return evaluateWithRule(cleanAddress, validAsOf, rule, false, Long.MAX_VALUE);
+    }
+
+    /**
+     * 批量历史回放专用：在批次开始时固定的提交水位 {@code maxSeq} 上评估。
+     * 数据（交易/标记）与规则版本都只取 {@code seq <= maxSeq} 的部分，
+     * 回放期间新提交/新发布的内容对整批不可见；点位自己的 asOf 过滤照常生效。
+     */
+    public RiskConclusion evaluateFenced(String address, long asOf, long maxSeq) {
+        String cleanAddress = QueryValidator.requireAddress(address);
+        long validAsOf = QueryValidator.requireAsOf(asOf);
+        RuleVersion rule = ruleService.requireRuleAt(validAsOf, maxSeq);
+        return evaluateWithRule(cleanAddress, validAsOf, rule, false, maxSeq);
     }
 
     /**
@@ -99,13 +119,13 @@ public class RiskPropagationService {
         String cleanAddress = QueryValidator.requireAddress(address);
         long validAsOf = QueryValidator.requireAsOf(asOf);
         RuleVersion rule = ruleService.requireVersion(version);
-        return evaluateWithRule(cleanAddress, validAsOf, rule, true);
+        return evaluateWithRule(cleanAddress, validAsOf, rule, true, Long.MAX_VALUE);
     }
 
     private RiskConclusion evaluateWithRule(String address, long asOf, RuleVersion rule,
-                                            boolean pinnedVersion) {
-        List<RiskLabel> labels = labelRegistry.effectiveLabels(asOf);
-        GraphView view = buildSnapshot(asOf);
+                                            boolean pinnedVersion, long maxSeq) {
+        List<RiskLabel> labels = labelRegistry.effectiveLabels(asOf, maxSeq);
+        GraphView view = buildSnapshot(asOf, maxSeq);
 
         List<RiskPath> contributions = new ArrayList<>();
         for (RiskLabel label : labels) {
@@ -131,20 +151,27 @@ public class RiskPropagationService {
     public List<RiskConclusion> evaluateAll(long asOf) {
         long validAsOf = QueryValidator.requireAsOf(asOf);
         RuleVersion rule = ruleService.requireRuleAt(validAsOf);
-        return evaluateAllWithRule(validAsOf, rule, false);
+        return evaluateAllWithRule(validAsOf, rule, false, Long.MAX_VALUE);
+    }
+
+    /** 批量历史回放专用：全量评估，数据与规则都限制在提交水位 {@code maxSeq}（含）之前 */
+    public List<RiskConclusion> evaluateAllFenced(long asOf, long maxSeq) {
+        long validAsOf = QueryValidator.requireAsOf(asOf);
+        RuleVersion rule = ruleService.requireRuleAt(validAsOf, maxSeq);
+        return evaluateAllWithRule(validAsOf, rule, false, maxSeq);
     }
 
     /** 某时点全部相关地址的风险结论，显式指定规则版本复现 */
     public List<RiskConclusion> evaluateAll(long asOf, int version) {
         long validAsOf = QueryValidator.requireAsOf(asOf);
         RuleVersion rule = ruleService.requireVersion(version);
-        return evaluateAllWithRule(validAsOf, rule, true);
+        return evaluateAllWithRule(validAsOf, rule, true, Long.MAX_VALUE);
     }
 
     private List<RiskConclusion> evaluateAllWithRule(long asOf, RuleVersion rule,
-                                                     boolean pinnedVersion) {
-        List<RiskLabel> labels = labelRegistry.effectiveLabels(asOf);
-        GraphView view = buildSnapshot(asOf);
+                                                     boolean pinnedVersion, long maxSeq) {
+        List<RiskLabel> labels = labelRegistry.effectiveLabels(asOf, maxSeq);
+        GraphView view = buildSnapshot(asOf, maxSeq);
 
         // 预先计算每个风险源的可达结果，避免重复搜索
         Map<String, Map<String, RiskPath>> bySource = new LinkedHashMap<>();
