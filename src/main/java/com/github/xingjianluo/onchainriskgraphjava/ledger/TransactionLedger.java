@@ -58,7 +58,23 @@ public class TransactionLedger {
 
     /** 截至 asOf（含）可见的全部交易，按 (visibleAt, txId) 确定性排序 */
     public List<Transaction> visibleTransactions(long asOf) {
-        return byTxId.values().stream()
+        return filterVisible(snapshotTransactions(), asOf);
+    }
+
+    /**
+     * 采集时刻账本的全量不可变副本（已幂等去重）。
+     * 批量回放开始时采集一次；采集之后并发入账的交易不会进入该副本，
+     * 哪怕其 visibleAt 自称在过去。
+     */
+    public List<Transaction> snapshotTransactions() {
+        // ConcurrentHashMap#values 的迭代为弱一致：反映的是迭代期间某一时刻的账本状态，
+        // 先落到本地 List 再冻结，快照一旦形成就与后续写入彻底脱钩。
+        return List.copyOf(byTxId.values());
+    }
+
+    /** 在给定快照副本上按 visibleAt &lt;= asOf 过滤并确定性排序 */
+    public static List<Transaction> filterVisible(List<Transaction> snapshot, long asOf) {
+        return snapshot.stream()
                 .filter(t -> t.visibleAt() <= asOf)
                 .sorted(Comparator.comparingLong(Transaction::visibleAt)
                         .thenComparing(Transaction::txId))

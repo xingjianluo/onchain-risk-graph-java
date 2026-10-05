@@ -59,7 +59,21 @@ public class RuleService {
 
     /** 某时间点适用的规则版本（effectiveAt <= asOf 的最新版本） */
     public synchronized Optional<RuleVersion> ruleAt(long asOf) {
-        return versions.stream()
+        return ruleAt(rulesSnapshot(), asOf);
+    }
+
+    /**
+     * 采集时刻已发布规则版本的全量不可变副本（按版本号升序；版本一经发布即不可变）。
+     * 批量回放开始时采集一次；采集之后并发发布的规则版本不会进入该副本，
+     * 哪怕其 effectiveAt 自称在过去——因此不会顶替某历史时点原本应选用的版本。
+     */
+    public synchronized List<RuleVersion> rulesSnapshot() {
+        return List.copyOf(versions);
+    }
+
+    /** 在给定快照副本上选 {@code effectiveAt <= asOf} 的最新版本（时间点自动选取语义） */
+    public static Optional<RuleVersion> ruleAt(List<RuleVersion> snapshot, long asOf) {
+        return snapshot.stream()
                 .filter(r -> r.effectiveAt() <= asOf)
                 .max(Comparator.comparingInt(RuleVersion::version));
     }
@@ -70,7 +84,12 @@ public class RuleService {
      * 与既有直接调用方的断言兼容）。
      */
     public synchronized RuleVersion requireRuleAt(long asOf) {
-        return ruleAt(asOf).orElseThrow(() -> new QueryNotFoundException(
+        return requireRuleAt(rulesSnapshot(), asOf);
+    }
+
+    /** 在给定规则快照上取某时点适用版本，不存在时抛出 {@link RejectReason#NO_EFFECTIVE_RULE} */
+    public static RuleVersion requireRuleAt(List<RuleVersion> snapshot, long asOf) {
+        return ruleAt(snapshot, asOf).orElseThrow(() -> new QueryNotFoundException(
                 RejectReason.NO_EFFECTIVE_RULE,
                 "时间点 " + asOf + " 之前没有任何已生效的风险规则版本，无法评估"));
     }

@@ -2,6 +2,7 @@ package com.github.xingjianluo.onchainriskgraphjava.service;
 
 import com.github.xingjianluo.onchainriskgraphjava.ledger.TransactionLedger;
 import com.github.xingjianluo.onchainriskgraphjava.model.RiskConclusion;
+import com.github.xingjianluo.onchainriskgraphjava.model.RiskDataSnapshot;
 import com.github.xingjianluo.onchainriskgraphjava.model.RiskLabel;
 import com.github.xingjianluo.onchainriskgraphjava.model.RiskPath;
 import com.github.xingjianluo.onchainriskgraphjava.model.RuleVersion;
@@ -55,9 +56,35 @@ public class RiskPropagationService {
         this.ruleService = ruleService;
     }
 
-    /** 构建仅含 asOf（含）之前可见交易的不可变图视图 */
+    /**
+     * 采集当前全部数据源（账本/风险标记/规则版本）的一致性快照。
+     *
+     * <p>批量回放开始时调用一次：此后并发入账/登记/发布（含自称时间戳落在过去的数据）
+     * 都不会进入快照；各点位再在同一快照上按 asOf 过滤，整批结论因此固定不变。
+     */
+    public RiskDataSnapshot captureSnapshot() {
+        long now = System.currentTimeMillis();
+        List<Transaction> txs = ledger.snapshotTransactions();
+        List<RiskLabel> riskLabels = labelRegistry.snapshotLabels();
+        List<RuleVersion> ruleVersions = ruleService.rulesSnapshot();
+        log.info("批量回放数据快照采集完成 capturedAt={}：交易 {} 笔，风险标记 {} 个，规则版本 {} 个",
+                now, txs.size(), riskLabels.size(), ruleVersions.size());
+        return new RiskDataSnapshot(now, txs, riskLabels, ruleVersions);
+    }
+
+    /** 构建仅含 asOf（含）之前可见交易的不可变图视图（基于实时账本） */
     public GraphView buildSnapshot(long asOf) {
-        List<Transaction> txs = ledger.visibleTransactions(asOf);
+        return buildSnapshot(ledger.snapshotTransactions(), asOf);
+    }
+
+    /** 在给定数据快照上构建仅含 asOf（含）之前可见交易的不可变图视图 */
+    public GraphView buildSnapshot(RiskDataSnapshot data, long asOf) {
+        return buildSnapshot(data.transactions(), asOf);
+    }
+
+    /** 在给定交易快照副本上构建不可变图视图 */
+    private GraphView buildSnapshot(List<Transaction> txSnapshot, long asOf) {
+        List<Transaction> txs = TransactionLedger.filterVisible(txSnapshot, asOf);
         Map<String, List<Edge>> outgoing = new HashMap<>();
         Set<String> nodes = new TreeSet<>();
         for (Transaction tx : txs) {
@@ -91,6 +118,18 @@ public class RiskPropagationService {
     }
 
     /**
+     * 在<b>批量回放开始时采集的一致性数据快照</b>上评估某地址风险（默认时间点选规则语义）。
+     * 规则版本从快照内选 {@code effectiveAt <= asOf} 的最新版本；回放期间才发布的版本
+     * 不在快照中，既不会顶替历史时点应选版本，也不会改变结论。
+     */
+    public RiskConclusion evaluate(RiskDataSnapshot data, String address, long asOf) {
+        String cleanAddress = QueryValidator.requireAddress(address);
+        long validAsOf = QueryValidator.requireAsOf(asOf);
+        RuleVersion rule = RuleService.requireRuleAt(data.rules(), validAsOf);
+        return evaluateWithRule(data, cleanAddress, validAsOf, rule, false);
+    }
+
+    /**
      * 在 asOf 时点的快照上，<b>显式指定一个已经发布过的规则版本</b>复现结论。
      * 数据快照（交易/标记可见性）仍只取 asOf（含）之前；规则则严格使用指定版本，
      * 不随时间点自动选择，也不会被之后发布的新版本带偏。
@@ -104,8 +143,17 @@ public class RiskPropagationService {
 
     private RiskConclusion evaluateWithRule(String address, long asOf, RuleVersion rule,
                                             boolean pinnedVersion) {
-        List<RiskLabel> labels = labelRegistry.effectiveLabels(asOf);
-        GraphView view = buildSnapshot(asOf);
+        return evaluateWithRule(null, address, asOf, rule, pinnedVersion);
+    }
+
+    private RiskConclusion evaluateWithRule(RiskDataSnapshot data, String address, long asOf,
+                                            RuleVersion rule, boolean pinnedVersion) {
+        List<RiskLabel> labels = data == null
+                ? labelRegistry.effectiveLabels(asOf)
+                : RiskLabelRegistry.filterEffective(data.labels(), asOf);
+        GraphView view = data == null
+                ? buildSnapshot(asOf)
+                : buildSnapshot(data, asOf);
 
         List<RiskPath> contributions = new ArrayList<>();
         for (RiskLabel label : labels) {
@@ -134,6 +182,13 @@ public class RiskPropagationService {
         return evaluateAllWithRule(validAsOf, rule, false);
     }
 
+    /** 在批量回放的数据快照上评估某时点全部相关地址（规则按时间点自动选取，限于快照内版本） */
+    public List<RiskConclusion> evaluateAll(RiskDataSnapshot data, long asOf) {
+        long validAsOf = QueryValidator.requireAsOf(asOf);
+        RuleVersion rule = RuleService.requireRuleAt(data.rules(), validAsOf);
+        return evaluateAllWithRule(data, validAsOf, rule, false);
+    }
+
     /** 某时点全部相关地址的风险结论，显式指定规则版本复现 */
     public List<RiskConclusion> evaluateAll(long asOf, int version) {
         long validAsOf = QueryValidator.requireAsOf(asOf);
@@ -143,8 +198,17 @@ public class RiskPropagationService {
 
     private List<RiskConclusion> evaluateAllWithRule(long asOf, RuleVersion rule,
                                                      boolean pinnedVersion) {
-        List<RiskLabel> labels = labelRegistry.effectiveLabels(asOf);
-        GraphView view = buildSnapshot(asOf);
+        return evaluateAllWithRule(null, asOf, rule, pinnedVersion);
+    }
+
+    private List<RiskConclusion> evaluateAllWithRule(RiskDataSnapshot data, long asOf,
+                                                     RuleVersion rule, boolean pinnedVersion) {
+        List<RiskLabel> labels = data == null
+                ? labelRegistry.effectiveLabels(asOf)
+                : RiskLabelRegistry.filterEffective(data.labels(), asOf);
+        GraphView view = data == null
+                ? buildSnapshot(asOf)
+                : buildSnapshot(data, asOf);
 
         // 预先计算每个风险源的可达结果，避免重复搜索
         Map<String, Map<String, RiskPath>> bySource = new LinkedHashMap<>();

@@ -50,7 +50,21 @@ public class RiskLabelRegistry {
     }
 
     public List<RiskLabel> effectiveLabels(long asOf) {
-        return byAddress.values().stream()
+        return filterEffective(snapshotLabels(), asOf);
+    }
+
+    /**
+     * 采集时刻已登记风险标记的全量不可变副本。
+     * 批量回放开始时采集一次；采集之后并发登记的风险地址不会进入该副本，
+     * 哪怕其 effectiveAt 自称在过去。
+     */
+    public List<RiskLabel> snapshotLabels() {
+        return List.copyOf(byAddress.values());
+    }
+
+    /** 在给定快照副本上按 effectiveAt &lt;= asOf 过滤并按地址确定性排序 */
+    public static List<RiskLabel> filterEffective(List<RiskLabel> snapshot, long asOf) {
+        return snapshot.stream()
                 .filter(l -> l.effectiveAt() <= asOf)
                 .sorted(Comparator.comparing(RiskLabel::address))
                 .toList();
